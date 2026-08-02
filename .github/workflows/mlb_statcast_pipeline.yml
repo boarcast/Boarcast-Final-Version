@@ -1,0 +1,101 @@
+name: MLB Statcast 每日自動增量更新
+
+on:
+  schedule:
+    # cron 只吃 UTC。美東時間 05:00 對應：
+    #   - 夏令時間 EDT（UTC-4，約 3 月中 ~ 11 月初）→ UTC 09:00
+    #   - 標準時間 EST（UTC-5，約 11 月初 ~ 3 月中）→ UTC 10:00
+    # 兩條 cron 都排上去，腳本本身用 America/New_York 時區計算「昨天」，
+    # 所以就算某天兩條 cron 都觸發（或都沒觸發在正確時刻），也不會抓錯日期，
+    # 頂多多跑一次、被去重複邏輯吃掉而已。
+    #
+    # [2026 Rev 4] 本系統明確定位為「僅例行賽 (Regular Season)」分析工具，
+    # 月份欄位收斂為 3~10 月（涵蓋 2 月底東京/首爾海外開幕賽的前置緩衝，
+    # 至例行賽例行例常於 9 月底 ~ 10 月初結束為止），11 月起的季後賽
+    # （Division Series ~ World Series）不在本工具排程範圍內，避免每天固定
+    # 觸發兩次、卻注定被 daily_update_20260731.py 的 game_type == 'R' 過濾清空的無謂
+    # Actions 執行額度消耗。daily_update_20260731.py 內部也有一層休賽季保護
+    # （[Rev 2]/[Rev 4]，OFFSEASON_MONTHS 現含 11 月）作為第二道防線，
+    # 即使 cron 排程不慎在休賽季觸發也會被腳本靜默略過，不會出錯。
+    - cron: "0 9 * 3-10 *"
+    - cron: "0 10 * 3-10 *"
+  workflow_dispatch: {}  # 保留手動觸發開關（休賽期仍可手動觸發補抓或除錯，不受月份限制）
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mlb-daily-update
+  cancel-in-progress: false
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run incremental Statcast update (Module 1)
+        run: python scripts/daily_update_20260731.py
+
+      # [Fix] 2026-08-02：先前 workflow 直接 `run: python scripts/anomaly_detector.py`，
+      # 但該檔案尚未存在於 repo 的 scripts/ 資料夾中，導致 Python 立即丟出
+      # `[Errno 2] No such file or directory` 並以 exit code 2 結束該步驟，
+      # 使整個 update-data job 判定為 Failure（即使 Module 1 資料更新其實成功）。
+      # 這裡改用「先偵測檔案是否存在」的做法：檔案不存在時，優雅跳過並留下
+      # 明確的 warning annotation 說明原因，不讓整個排程因為 Module 2 尚未就緒
+      # 而連帶卡住 Module 1 的資料更新與 commit。日後把 anomaly_detector.py
+      # 加進 repo 後，這一步會自動偵測到並正常執行，不需要再改 yml。
+      - name: Check if anomaly detector script exists
+        id: check_anomaly_script
+        run: |
+          if [ -f scripts/anomaly_detector.py ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::scripts/anomaly_detector.py 尚未建立，本次自動略過 Module 2（異常偵測）步驟，僅執行 Module 1 資料更新。"
+          fi
+
+      - name: Run anomaly detector (Module 2)
+        if: steps.check_anomaly_script.outputs.exists == 'true'
+        run: python scripts/anomaly_detector.py
+
+      - name: Commit and push updated data files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # [2026 Rev] daily_update_20260731.py 的資料路徑已改為動態年份檔名
+          # （data/statcast_{year}.parquet），並另外維護一份
+          # data/statcast_current_season.parquet 相容捷徑（symlink 或複製檔），
+          # 這裡改用萬用字元把「所有年度的 parquet」與相容捷徑都納入 git add，
+          # 避免新賽季開打、產生新檔名時被 commit 步驟遺漏。
+          #
+          # [Fix] 2026-08-02：git add 對「不存在的檔案」會直接報錯並讓這一步
+          # 失敗（fatal: pathspec did not match any files），而 Module 2 的
+          # anomaly_detector.py 目前尚未就緒、可能被上一步跳過，導致
+          # data/anomaly_today.json 根本不存在。這裡分成兩行、並對
+          # anomaly_today.json 先做存在性檢查，避免它單獨拖垮整個 commit 步驟；
+          # parquet 萬用字元本身若無任何匹配也不會報錯，維持原樣即可。
+          git add data/statcast_*.parquet
+          if [ -f data/anomaly_today.json ]; then
+            git add data/anomaly_today.json
+          fi
+          if git diff --cached --quiet; then
+            echo "ℹ️ 沒有資料變動，略過 commit。"
+          else
+            SEASON_YEAR="$(TZ=America/New_York date +'%Y')"
+            git commit -m "chore: update ${SEASON_YEAR} Statcast data ($(date -u +'%Y-%m-%d'))"
+            git push
+          fi
